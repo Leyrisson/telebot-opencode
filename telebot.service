@@ -1,0 +1,24 @@
+# Ponte Telegram <-> opencode por long-polling.
+# Unidade de USUÁRIO: liga junto com a sessão gráfica, sem sudo.
+#   systemctl --user enable --now telebot
+
+[Unit]
+Description=telebot — ponte Telegram <-> opencode (long-polling, sem porta aberta)
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.config/omarchy-voice/plugins/telebot/telebot.py
+WorkingDirectory=%h
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+Restart=always
+RestartSec=10
+# o opencode pode demorar; o bot só reinicia se o processo MORRER
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

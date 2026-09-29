@@ -1,0 +1,19 @@
+# segredos — nunca versionar
+credenciais.env
+*.env
+!*.env.example
+
+# estado de execução (sessão do opencode, log, lock)
+*.log
+*.lock
+pendente.txt
+sessao.txt
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# do opencode
+tool-output/
