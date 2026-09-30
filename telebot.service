@@ -11,8 +11,23 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/python3 %h/.config/omarchy-voice/plugins/telebot/telebot.py
 WorkingDirectory=%h
+
+# --- O PATH do systemd é mínimo e NÃO tem o opencode -----------------------
+# O PATH padrão de uma unidade de usuário é só /usr/local/bin:/usr/bin. O
+# opencode vive em ~/.local/bin (via mise, no Arch/Omarchy), então antes
+# desta linha TODA tarefa morria com FileNotFoundError: opencode, mesmo com
+# o resto do bot funcionando. Se o seu opencode estiver em outro lugar,
+# ajuste aqui — ou apague esta linha e o próprio telebot.py cuida
+# (monta_path + acha_binario procuram em ~/.local/bin, ~/.local/share/mise,
+# /usr/share/omarchy/bin, entre outros).
+Environment=PATH=/usr/share/omarchy/bin:%h/.local/bin:%h/.local/share/mise/shims:%h/.local/share/mise/installs/node/latest/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+
+# Wayland/X11: o telebot.py descobre o display sozinho (descobre_wayland),
+# por isso estas duas linhas são opcionais. Defina-as se o seu caso for
+# diferente do padrão do Omarchy/Hyprland.
 Environment=DISPLAY=:0
-Environment=WAYLAND_DISPLAY=wayland-1
+# Environment=WAYLAND_DISPLAY=wayland-1
+
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 Restart=always
