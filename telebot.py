@@ -18,6 +18,8 @@ Rode serviço:  systemctl --user start telebot
 """
 import json
 import os
+import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -35,13 +37,67 @@ ENV = BASE / "credenciais.env"
 STATE = HOME / ".local/state/omarchy-voice/telebot"
 LOG = STATE / "telebot.log"
 SESSAO = STATE / "sessao.txt"
+OFFSET = STATE / "offset.txt"     # ultima update confirmada (evita replay)
 PEND = STATE / "pendente.txt"      # o que o opencode está fazendo agora
 LOCK = STATE / "rodando.lock"
 
 TELEGRAM = "https://api.telegram.org"
-OPENCODE = os.environ.get("OPENCODE_BIN") or shutil.which("opencode") or "opencode"
 WORKDIR = HOME                     # onde o opencode trabalha
+
+
+def monta_path():
+    """Monta o PATH do seu PC — o que o serviço systemd NÃO tem.
+
+    Bug de 30/09: o serviço herda o PATH do systemd (`/usr/local/bin:/usr/bin`),
+    onde não existe o opencode (ele vive no mise). Resultado: shutil.which()
+    devolvia None, o bot caía no literal "opencode" e TODA tarefa morria com
+    FileNotFoundError. Aqui o PATH é reconstruído com os diretórios reais.
+    """
+    extras = [
+        Path("/usr/share/omarchy/bin"),
+        HOME / ".local/bin",
+        HOME / ".local/share/mise/shims",
+        HOME / ".bun/bin",
+    ]
+    mise = HOME / ".local/share/mise/installs"
+    if mise.is_dir():
+        extras += sorted(mise.glob("*/bin")) + sorted(mise.glob("*/*/bin"))
+    base = ["/usr/local/bin", "/usr/bin", "/bin",
+            "/usr/local/sbin", "/usr/sbin", "/sbin"]
+    return ":".join(dict.fromkeys([str(p) for p in extras if p.is_dir()] + base))
+
+
+PATH = monta_path()
+
+
+def acha_binario(nome):
+    """Procura um executável no PATH montado (funciona fora do seu shell)."""
+    achado = shutil.which(nome, path=PATH)
+    if achado:
+        return achado
+    for p in PATH.split(":"):
+        alvo = Path(p) / nome
+        if alvo.is_file() and os.access(alvo, os.X_OK):
+            return str(alvo)
+    return None
+
+
+def descobre_wayland():
+    """WAYLAND_DISPLAY certo: o do serviço pode ser obsoleto após um reboot."""
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    atual = os.environ.get("WAYLAND_DISPLAY", "")
+    if atual and (runtime / atual).exists():
+        return atual
+    for sock in sorted(runtime.glob("wayland-*")):
+        if sock.name.endswith(".lock"):
+            continue
+        return sock.name
+    return atual or "wayland-1"
+
+
+OPENCODE = os.environ.get("OPENCODE_BIN") or acha_binario("opencode") or "opencode"
 TIMEOUT = 45 * 60                  # 45 min por tarefa (sistema flask pede tempo)
+PACIENCIA = 60                     # sem NENHUM evento por isso = sessão morta
 MAX_ENVIO = 3800                   # Telegram corta em 4096; fica folga p/ moldura
 POLL = 30                          # segundos de long-poll
 
@@ -51,14 +107,27 @@ POLL = 30                          # segundos de long-poll
 CHAT_ID = ""
 
 _lock = threading.Lock()
+_ultimo_log = 0.0
 
 
 def log(msg):
+    """Escreve no log. Sempre."""
     STATE.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with LOG.open("a") as f:
         f.write(f"{ts} {msg}\n")
     print(f"{ts} {msg}", flush=True)
+
+
+def log_erro(msg):
+    """Log de erro com freio: a mesma falha repetida (ex.: sem rede no boot)
+    entra 1x por minuto, não 1x por tentativa."""
+    global _ultimo_log
+    agora = time.time()
+    if agora - _ultimo_log < 60:
+        return
+    _ultimo_log = agora
+    log(msg)
 
 
 def load_env():
@@ -89,9 +158,9 @@ def api(env, metodo, payload=None, params=None, timeout=70):
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         corpo = e.read().decode(errors="replace")[:300]
-        log(f"ERRO telegram {metodo}: HTTP {e.code} {corpo}")
+        log_erro(f"ERRO telegram {metodo}: HTTP {e.code} {corpo}")
     except Exception as e:
-        log(f"ERRO telegram {metodo}: {e}")
+        log_erro(f"ERRO telegram {metodo}: {e}")
     return None
 
 
@@ -132,20 +201,50 @@ def guarda_sessao(sid):
     SESSAO.write_text(sid)
 
 
+def le_offset():
+    try:
+        return int(OFFSET.read_text().strip())
+    except Exception:
+        return 0
+
+
+def guarda_offset(valor):
+    STATE.mkdir(parents=True, exist_ok=True)
+    OFFSET.write_text(str(valor))
+
+
+def _consome(fluxo, fila):
+    """Joga as linhas do opencode numa fila (thread separada)."""
+    try:
+        for ln in fluxo:
+            fila.put(ln)
+    finally:
+        fila.put(None)
+
+
 def roda_opencode(pergunta):
     """Executa o opencode e devolve (texto, ok).
 
-    Usa a MESMA sessão entre mensagens, então o bot tem memória. Se a sessão
-    sumiu (apagada no TUI, banco limpo), recomeça sem --session em vez de
-    falhar — e avisa que perdeu o contexto.
+    Usa a MESMA sessão entre mensagens, então o bot tem memória.
+
+    Não espera o PROCESSO sair: lê o stream JSON e, quando chega o `step_finish`
+    (o turno acabou), mata o opencode. Bug de 30/09: retomar uma sessão antiga
+    deixava o processo travado para sempre depois de já ter respondido — o bot
+    ficava 45 min parado esperando e o dono achava que o pedido tinha falhado.
+    Ler o stream e matar é imune a isso.
     """
     env = os.environ.copy()
     env.update({
+        "PATH": PATH,
+        "HOME": str(HOME),
         "DISPLAY": env.get("DISPLAY", ":0"),
-        "WAYLAND_DISPLAY": env.get("WAYLAND_DISPLAY", "wayland-1"),
-        "XDG_RUNTIME_DIR": env.get("XDG_RUNTIME_DIR", "/run/user/1000"),
+        "WAYLAND_DISPLAY": descobre_wayland(),
+        "XDG_RUNTIME_DIR": env.get("XDG_RUNTIME_DIR",
+                                   f"/run/user/{os.getuid()}"),
         "DBUS_SESSION_BUS_ADDRESS": env.get(
-            "DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            "DBUS_SESSION_BUS_ADDRESS",
+            f"unix:path=/run/user/{os.getuid()}/bus"),
+        "XDG_SESSION_TYPE": "wayland",
     })
     sid = le_sessao()
 
@@ -159,49 +258,171 @@ def roda_opencode(pergunta):
             c += ["--session", sid]
         # "--" garante que um texto comecando com "-" nao vire flag do yargs
         c += ["--", pergunta]
-        return subprocess.run(c, capture_output=True, text=True,
-                              timeout=TIMEOUT, cwd=str(WORKDIR), env=env)
+        proc = subprocess.Popen(c, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                stdin=subprocess.DEVNULL, cwd=str(WORKDIR), env=env)
+        fila = queue.Queue()
+        threading.Thread(target=_consome, args=(proc.stdout, fila),
+                         daemon=True).start()
+        texto, novo_sid, bruto = [], "", []
+        fim = time.time() + TIMEOUT
+        sobra = fim          # deadline apertado depois do step_finish
+        ultimo = time.time()  # quando saiu o último evento
+        while True:
+            if time.time() > sobra:
+                break
+            try:
+                ln = fila.get(timeout=1.0)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    # processo morreu: drena o que sobrou na fila
+                    while not fila.empty():
+                        ln = fila.get_nowait()
+                        if ln is None:
+                            continue
+                        bruto.append(ln)
+                    break
+                # Nenhum evento nenhum por PACIENCIA: sessão estragada, o
+                # opencode fica mudo e o processo nunca sai (bug de 30/09).
+                if not bruto and time.time() - ultimo > PACIENCIA:
+                    break
+                continue
+            if ln is None:
+                break           # stdout fechou: acabou
+            bruto.append(ln)
+            ultimo = time.time()
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            if d.get("sessionID"):
+                novo_sid = novo_sid or d["sessionID"]
+            if d.get("type") == "text":
+                t = (d.get("part") or {}).get("text")
+                if t:
+                    texto.append(t)
+            if d.get("type") == "step_finish":
+                sobra = min(fim, time.time() + 8)
+        travado = proc.poll() is None
+        if travado:
+            proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        return (("\n".join(texto).strip(), novo_sid, proc.returncode,
+                 "\n".join(bruto)), travado)
 
     try:
-        r = executa()
-    except subprocess.TimeoutExpired:
-        return (f"Estourei o tempo de {TIMEOUT // 60} min nessa tarefa. "
-                "Tente de novo em partes menores.", False)
+        (saida, novo_sid, rc, bruto), travado = executa()
+    except FileNotFoundError:
+        return (f"❌ Não achei o opencode neste PC. "
+                f"Procurei em: {OPENCODE}.", False)
     except Exception as e:
         return (f"Falhou ao rodar o opencode: {e}", False)
 
-    # Saiu com erro? Uma sessão morta é a causa mais comum — tenta de novo.
-    if r.returncode != 0 and sid:
-        log("sessao falhou; tentando sem --session")
-        try:
-            r2 = executa(usar_sessao=False)
-        except Exception as e:
-            return (f"Falhou: {e}", False)
-        if r2.returncode == 0:
-            r = r2
+    if saida and novo_sid:
+        # Só reaproveita a sessão se o opencode encerrou sozinho. Quando é
+        # preciso matar, a sessão fica com estado pela metade e a PRÓXIMA tarefa
+        # que tentar retomá-la trava — melhor perder a memória do que travar.
+        guarda_sessao("" if travado else novo_sid)
+        if travado:
+            log("opencode nao encerrou sozinho; contexto descartado")
+
+    # Não respondeu nada? A sessão salva deve estar estragada — joga fora e
+    # tenta uma vez do zero, senão o bot fica travado em loop.
+    if not saida:
+        if sid:
+            log("sem resposta; zerando a sessao salva e tentando de novo")
             guarda_sessao("")
-        else:
-            return (f"Erro do opencode: {(r2.stderr or r2.stdout)[-800:]}", False)
+            try:
+                (saida, novo_sid, rc, bruto), travado = executa(usar_sessao=False)
+            except Exception as e:
+                return (f"Falhou: {e}", False)
+            if saida and novo_sid:
+                guarda_sessao("" if travado else novo_sid)
 
-    if r.returncode != 0:
-        return (f"Erro do opencode: {(r.stderr or r.stdout)[-800:]}", False)
+    if saida:
+        return (saida + ("\n\n_(opencode não fechou sozinho; encerrei)_"
+                         if travado else ""), True)
+    return ((f"Erro do opencode (rc={rc}): {bruto[-600:]}"
+             if not travado else
+             f"⏱️ O opencode travou sem responder em {TIMEOUT // 60} min. "
+             "Zerei o contexto — manda de novo que eu tento do zero."), False)
 
-    texto, novo_sid = [], ""
-    for ln in r.stdout.splitlines():
-        try:
-            d = json.loads(ln)
-        except Exception:
-            continue
-        if d.get("sessionID"):
-            novo_sid = novo_sid or d["sessionID"]
-        if d.get("type") == "text":
-            t = (d.get("part") or {}).get("text")
-            if t:
-                texto.append(t)
-    if novo_sid and novo_sid != le_sessao():
-        guarda_sessao(novo_sid)
-    saida = "\n".join(texto).strip()
-    return (saida or "(opencode terminou sem texto)", True)
+
+APPS = {
+    "firefox": ["firefox"], "navegador": ["firefox"], "browser": ["firefox"],
+    "chrome": ["google-chrome-stable", "chromium"], "chromium": ["chromium"],
+    "vscode": ["code"], "codigo": ["code"], "code": ["code"],
+    "terminal": ["alacritty"], "emulador": ["alacritty"], "kitty": ["kitty"],
+    "ghostty": ["ghostty"], "arquivos": ["nautilus"], "explorer": ["nautilus"],
+    "pastas": ["nautilus"], "spotify": ["spotify"], "discord": ["discord"],
+    "telegram": ["telegram-desktop"], "calculadora": ["qalculate"],
+    "loja": ["pamacor"], "okular": ["okular"],
+}
+
+
+def abrir_alvo(alvo):
+    """Abre um app/URL direto, sem passar pelo opencode.
+
+    Caminho determinístico: garante que o pedido mais comum do dono
+    ('abre o firefox') funcione de primeira, sem depender do opencode.
+    """
+    alvo = (alvo or "").strip().strip("<>\"'")
+    if not alvo:
+        return ("Diga o que abrir: /abrir firefox, /abrir vscode, "
+                "/abrir localhost:5000", False)
+    # URL (http, https, about:, file:, mailto:) — abre no navegador padrão
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:(//)?\S", alvo):
+        if not re.match(r"^(https?|file|mailto):", alvo, re.I):
+            return (f"Não abro '{alvo}' por segurança — só http(s), file e mailto.",
+                    False)
+        cmd = ["xdg-open", alvo]
+    else:
+        cmd = APPS.get(alvo.lower())
+        if not cmd:
+            achado = acha_binario(alvo)
+            if not achado:
+                return (f"Não achei o aplicativo '{alvo}' neste PC.\n"
+                        f"Apps rápidos: {', '.join(sorted(set(APPS))[:14])}…\n"
+                        "Ou mande a frase completa que eu uso o opencode.", False)
+            cmd = [alvo]
+    env = os.environ.copy()
+    env.update({"PATH": PATH, "DISPLAY": env.get("DISPLAY", ":0"),
+                "WAYLAND_DISPLAY": descobre_wayland(),
+                "XDG_RUNTIME_DIR": env.get("XDG_RUNTIME_DIR",
+                                           f"/run/user/{os.getuid()}"),
+                "DBUS_SESSION_BUS_ADDRESS": env.get(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    f"unix:path=/run/user/{os.getuid()}/bus")})
+    exe = cmd[0] if Path(cmd[0]).is_absolute() else acha_binario(cmd[0])
+    if not exe:
+        return (f"❌ Não achei '{cmd[0]}' no PATH deste serviço.", False)
+    try:
+        subprocess.Popen([exe] + cmd[1:], env=env, cwd=str(WORKDIR),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:
+        return (f"❌ Falhou ao abrir '{alvo}': {e}", False)
+    log(f"abriu {alvo} -> {exe}")
+    return (f"✅ Abri: *{alvo}*", True)
+
+
+def diagnostico():
+    """Roda do celular e mostra se a máquina está pronta pra trabalhar."""
+    linhas = [
+        f"opencode: `{OPENCODE}`",
+        f"existe no disco: {'sim' if Path(OPENCODE).exists() else 'NÃO ❌'}",
+        f"PATH: `{PATH[:110]}…`",
+        f"tela: DISPLAY={os.environ.get('DISPLAY')} "
+        f"WAYLAND={descobre_wayland()}",
+        f"firefox: {acha_binario('firefox') or 'NÃO achei ❌'}",
+        f"wayland socket: "
+        f"{'ok' if (Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user')) / descobre_wayland()).exists() else 'NÃO ❌'}",
+        f"sessão opencode: {le_sessao() or '(sem memória)'}",
+    ]
+    return "\n".join(linhas)
 
 
 def trata(mensagem):
@@ -211,8 +432,11 @@ def trata(mensagem):
     nome = (mensagem.get("from") or {}).get("first_name", "")
     if not texto or chat != CHAT_ID:
         return
+    log(f"msg de {nome}: {texto[:200]}")
 
-    cmd = texto.split()[0].lower().lstrip("/")
+    partes = texto.split(maxsplit=1)
+    cmd = partes[0].lower().lstrip("/")
+    resto = partes[1] if len(partes) > 1 else ""
     if cmd in ("start", "ajuda", "help"):
         manda(chat,
               "Oi! Eu sou o opencode no seu PC.\n\n"
@@ -223,12 +447,22 @@ def trata(mensagem):
               "• quanto disk ta sobrando?\n\n"
               "Eu executo aqui e respondo aqui. Lembro do contexto entre "
               "as mensagens. Tempo limite de 45 min por tarefa.\n\n"
-              "Comandos: /status (o que estou fazendo) · /novo (zera a memória) "
-              "· /start")
+              "Comandos: /abrir firefox (abre direto, na hora) · /teste "
+              "(diagnóstico) · /status (o que estou fazendo) · "
+              "/novo (zera a memória)")
         return
     if cmd == "status":
         oq = PEND.read_text().strip() if PEND.exists() else "nada"
         manda(chat, f"Agora eu estou: {oq}" if oq != "nada" else "Tô parado, esperando tarefa.")
+        return
+    if cmd == "teste":
+        manda(chat, "🩺 Diagnóstico:\n\n" + diagnostico())
+        return
+    if cmd == "abrir" and resto:
+        resposta, ok = abrir_alvo(resto)
+        marca = "✅" if ok else "⚠️"
+        manda(chat, f"{marca} {resposta}")
+        avisa_pc(f"{marca} {resto}", resposta)
         return
     if cmd == "novo":
         guarda_sessao("")
@@ -246,6 +480,7 @@ def trata(mensagem):
         PEND.unlink(missing_ok=True)
     dt = int(time.time() - inicio)
     marca = "✅" if ok else "⚠️"
+    log(f"tarefa em {dt}s ok={ok}: {resposta[:300].replace(chr(10), ' ')}")
     manda(chat, f"{marca} *Concluído em {dt}s*\n\n{resposta}")
     avisa_pc(f"{marca} opencode ({dt}s)", resposta)
 
@@ -256,22 +491,37 @@ def main():
     CHAT_ID = str(env.get("TELEGRAM_CHAT_ID", "")).strip()
     if not env.get("TELEGRAM_BOT_TOKEN"):
         print("sem TELEGRAM_BOT_TOKEN — veja credenciais.env", file=sys.stderr)
-        log("ERRO de boot: sem TELEGRAM_BOT_TOKEN em credenciais.env")
+        log_erro("ERRO de boot: sem TELEGRAM_BOT_TOKEN em credenciais.env")
         return 1
     if not CHAT_ID:
         print("sem TELEGRAM_CHAT_ID — veja credenciais.env", file=sys.stderr)
-        log("ERRO de boot: sem TELEGRAM_CHAT_ID em credenciais.env")
+        log_erro("ERRO de boot: sem TELEGRAM_CHAT_ID em credenciais.env")
         return 1
 
     STATE.mkdir(parents=True, exist_ok=True)
     log(f"ligado | chat {CHAT_ID} | opencode {OPENCODE}")
+    if not Path(OPENCODE).exists():
+        log(f"AVISO: opencode NAO existe em {OPENCODE} — toda tarefa vai falhar")
+
+    # Espera a rede: no boot a DNS ainda não resolve e o bot despejava erro.
+    for tentativa in range(30):
+        if api(env, "getMe"):
+            break
+        if tentativa == 0:
+            log_erro("rede ainda nao respondeu; aguardando")
+        time.sleep(10)
+
     # avisa no Telegram que subiu
     api(env, "sendMessage", {
         "chat_id": CHAT_ID,
         "text": "✅ opencode no PC <b>ligado</b>. Pode mandar tarefa.",
     })
 
-    offset = 0
+    # Offset persistido: sem isso, cada reinício do serviço RECEBE de novo a
+    # última mensagem e reexecuta a tarefa — inclusive "desliga o PC".
+    offset = le_offset()
+    log(f"retomando da update {offset}")
+    r = None
     while True:
         if not _lock.locked():
             _lock.acquire()
@@ -286,6 +536,7 @@ def main():
             continue
         for upd in r.get("result", []):
             offset = upd["update_id"] + 1
+            guarda_offset(offset)
             msg = upd.get("message") or {}
             # só o SEU chat dispara tarefa; o resto é ignorado em silêncio
             if str(msg.get("chat", {}).get("id", "")) != CHAT_ID:
@@ -293,7 +544,7 @@ def main():
             try:
                 trata(msg)
             except Exception as e:
-                log(f"ERRO tratando: {e}")
+                log_erro(f"ERRO tratando: {e}")
                 manda(CHAT_ID, f"⚠️ Deu erro aqui: {e}")
             time.sleep(1)
 

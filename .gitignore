@@ -8,6 +8,7 @@ credenciais.env
 *.lock
 pendente.txt
 sessao.txt
+offset.txt
 
 # python
 __pycache__/
