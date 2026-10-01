@@ -75,7 +75,7 @@ systemctl --user enable --now telebot
 O serviço é de **usuário** (`--user`), então liga junto com a sua sessão gráfica
 e não pede sudo.
 
-## Os três detalhes que fazem funcionar
+## Os quatro detalhes que fazem funcionar
 
 ### 1. `--auto`, senão a tarefa termina sem fazer nada
 
@@ -100,6 +100,27 @@ Sem guardar a última update processada, todo reinício do serviço faz o Telegr
 reenviar o histórico inteiro. O bot passa a repetir mensagens antigas e a
 reaplicar a última tarefa.
 
+### 4. `step_finish` é fim de **passo**, não de turno
+
+No stream JSON, `step_finish` sai **uma vez por passo do agente**. Uma tarefa de
+dois comandos gera dois `step_finish` — o segundo é o fim do turno de verdade.
+
+Tratar o primeiro como "acabou" (e usar isso para matar o processo) corta a
+tarefa no meio. Medido, com uma tarefa de dois comandos:
+
+```
+18.40s step_start   19.16s tool_use   19.16s step_finish   <-- fim do PASSO 1
+27.84s step_start   27.93s text        27.93s step_finish   <-- fim do TURNO
+```
+
+Com um prazo de 8s a partir do primeiro `step_finish`, o processo era morto às
+~27.2s — 0.7s antes da resposta, que o dono recebia como "o opencode travou".
+
+Aqui `step_finish` só reinicia um relógio. Quem decide que a tarefa acabou é o
+**processo sair** (o stdout fechar). Se o processo continuar vivo e calado por
+`CARENCIA`, aí sim ele é encerrado — é assim que o bot sobrevive ao outro
+clássico do opencode, que é responder e não encerrar.
+
 ## Variáveis
 
 | Variável | Padrão | Para quê |
@@ -108,7 +129,9 @@ reaplicar a última tarefa.
 | `TELEGRAM_CHAT_ID` | — | obrigatório, em `credenciais.env` (é a allowlist) |
 | `OPENCODE_BIN` | procurando no PATH e em locais conhecidos | caminho do binário, se não for achado |
 | `TIMEOUT` (código) | 45 min | teto por tarefa |
-| `PACIENCIA` (código) | 60 s | sem nenhum evento nesse tempo = sessão morta, descarta e tenta de novo |
+| `PACIENCIA` (código) | 120 s | sem **nenhum** evento nesse tempo = o opencode nem começou; descarta e tenta de novo |
+| `FIM_PERFEITO` (código) | 6 s | carência dada ao opencode para fechar sozinho depois do último passo |
+| `CARENCIA` (código) | 25 s | silêncio depois do último evento com o processo ainda vivo = travou; aí mata |
 | `POLL` (código) | 30 s | intervalo de long-poll |
 
 ## Estado e diagnóstico

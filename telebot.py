@@ -97,7 +97,19 @@ def descobre_wayland():
 
 OPENCODE = os.environ.get("OPENCODE_BIN") or acha_binario("opencode") or "opencode"
 TIMEOUT = 45 * 60                  # 45 min por tarefa (sistema flask pede tempo)
-PACIENCIA = 60                     # sem NENHUM evento por isso = sessão morta
+# Bug de 30/09 (o 4º): 60s era pouco. O opencode pode ficar **inteiramente
+# mudo** antes do primeiro evento — o boot dele sozinho leva ~18s com AGENTS.md
+# grande, e o provedor pode demorar. Medido: 18.4s de silêncio num tarefa de 2
+# comandos. Com 60s o bot se auto-curava antes da hora e jogava a tarefa fora.
+PACIENCIA = 120                    # sem NENHUM evento por isso = sessão morta
+# `step_finish` NÃO é o fim do turno: o opencode emite um a cada passo do
+# agente. Uma tarefa de 2 comandos gera 2 step_finish. Bug de 30/09 (o 4º): o
+# bot tratava o 1º step_finish como "terminou", armava um prazo de 8s e matava
+# o processo — cortando a tarefa 0.7s antes da resposta, que o dono via como
+# "travou". Agora step_finish só reinicia o relógio de silêncio; quem decide que
+# acabou é o processo SAIR (stdout fecha) ou o silêncio longo demais.
+FIM_PERFEITO = 6                   # após o último passo, espera o opencode fechar
+CARENCIA = 25                      # silêncio depois do último evento = travou
 MAX_ENVIO = 3800                   # Telegram corta em 4096; fica folga p/ moldura
 POLL = 30                          # segundos de long-poll
 
@@ -227,11 +239,19 @@ def roda_opencode(pergunta):
 
     Usa a MESMA sessão entre mensagens, então o bot tem memória.
 
-    Não espera o PROCESSO sair: lê o stream JSON e, quando chega o `step_finish`
-    (o turno acabou), mata o opencode. Bug de 30/09: retomar uma sessão antiga
-    deixava o processo travado para sempre depois de já ter respondido — o bot
-    ficava 45 min parado esperando e o dono achava que o pedido tinha falhado.
-    Ler o stream e matar é imune a isso.
+    Quem decide que a tarefa acabou é o PROCESSO SAIR (o stdout fecha), e não um
+    evento do stream. Dois bugs de 30/09 explicam por quê:
+
+    1. Retomar sessão antiga deixava o processo travado para sempre depois de já
+       ter respondido — o bot ficava 45 min parado e o dono achava que o pedido
+       tinha falhado.
+    2. `step_finish` NÃO é o fim do turno: sai um a cada passo do agente. Tratar
+       o primeiro como "terminou" matava a tarefa no meio (prova: uma tarefa de
+       2 comandos, resposta 0.7s depois do prazo de 8s).
+
+    Então: `step_finish` só reinicia o relógio. Sai no fim de verdade — processo
+    fechou, ou CARENCIA de silêncio depois do último evento (o processo continua
+    vivo e mudo, aí mata), ou TIMEOUT.
     """
     env = os.environ.copy()
     env.update({
@@ -264,13 +284,11 @@ def roda_opencode(pergunta):
         fila = queue.Queue()
         threading.Thread(target=_consome, args=(proc.stdout, fila),
                          daemon=True).start()
-        texto, novo_sid, bruto = [], "", []
+        texto, novo_sid, bruto, passos = [], "", [], 0
         fim = time.time() + TIMEOUT
-        sobra = fim          # deadline apertado depois do step_finish
         ultimo = time.time()  # quando saiu o último evento
-        while True:
-            if time.time() > sobra:
-                break
+        motivo = "processo encerrou"
+        while time.time() < fim:
             try:
                 ln = fila.get(timeout=1.0)
             except queue.Empty:
@@ -282,13 +300,20 @@ def roda_opencode(pergunta):
                             continue
                         bruto.append(ln)
                     break
-                # Nenhum evento nenhum por PACIENCIA: sessão estragada, o
-                # opencode fica mudo e o processo nunca sai (bug de 30/09).
-                if not bruto and time.time() - ultimo > PACIENCIA:
+                calado = time.time() - ultimo
+                if not bruto and calado > PACIENCIA:
+                    # Nenhum evento nenhum desde o começo: o opencode nem
+                    # começou (sessão estragada, ou boot lento demais).
+                    motivo = f"nenhum evento em {PACIENCIA}s"
+                    break
+                if bruto and calado > CARENCIA:
+                    # Teve evento, mas calou: o opencode travou sem fechar.
+                    motivo = f"calou {CARENCIA}s depois do último evento"
                     break
                 continue
             if ln is None:
-                break           # stdout fechou: acabou
+                motivo = "stdout fechou"   # acabou de vez
+                break
             bruto.append(ln)
             ultimo = time.time()
             try:
@@ -302,7 +327,12 @@ def roda_opencode(pergunta):
                 if t:
                     texto.append(t)
             if d.get("type") == "step_finish":
-                sobra = min(fim, time.time() + 8)
+                # FIM DE PASSO, não de turno: só dá mais FIM_PERFEITO de prazo
+                # pro opencode fechar sozinho depois do último passo.
+                passos += 1
+                ultimo = time.time() - FIM_PERFEITO
+        else:
+            motivo = f"passou de {TIMEOUT // 60} min"
         travado = proc.poll() is None
         if travado:
             proc.kill()
@@ -310,11 +340,13 @@ def roda_opencode(pergunta):
             proc.wait(timeout=10)
         except Exception:
             pass
+        if passos:
+            log(f"opencode: {passos} passo(s), {motivo}")
         return (("\n".join(texto).strip(), novo_sid, proc.returncode,
-                 "\n".join(bruto)), travado)
+                 "\n".join(bruto), motivo), travado)
 
     try:
-        (saida, novo_sid, rc, bruto), travado = executa()
+        (saida, novo_sid, rc, bruto, motivo), travado = executa()
     except FileNotFoundError:
         return (f"❌ Não achei o opencode neste PC. "
                 f"Procurei em: {OPENCODE}.", False)
@@ -333,10 +365,11 @@ def roda_opencode(pergunta):
     # tenta uma vez do zero, senão o bot fica travado em loop.
     if not saida:
         if sid:
-            log("sem resposta; zerando a sessao salva e tentando de novo")
+            log(f"sem resposta ({motivo}); zerando a sessao e tentando de novo")
             guarda_sessao("")
             try:
-                (saida, novo_sid, rc, bruto), travado = executa(usar_sessao=False)
+                (saida, novo_sid, rc, bruto,
+                 motivo), travado = executa(usar_sessao=False)
             except Exception as e:
                 return (f"Falhou: {e}", False)
             if saida and novo_sid:
@@ -345,10 +378,15 @@ def roda_opencode(pergunta):
     if saida:
         return (saida + ("\n\n_(opencode não fechou sozinho; encerrei)_"
                          if travado else ""), True)
-    return ((f"Erro do opencode (rc={rc}): {bruto[-600:]}"
-             if not travado else
-             f"⏱️ O opencode travou sem responder em {TIMEOUT // 60} min. "
-             "Zerei o contexto — manda de novo que eu tento do zero."), False)
+    # A mensagem tem que dizer o que ACONTECEU, não o prazo teórico: o dono
+    # lia "travou sem responder em 45 min" em tarefas que cortaram em 8s e achava
+    # que o bot era lento, quando na verdade ele tinha matado a tarefa.
+    if not travado:
+        return (f"❌ O opencode encerrou com erro (rc={rc}):\n{bruto[-600:]}",
+                False)
+    return (f"⏱️ O opencode {motivo} e eu tive que encerrá-lo — "
+            "não respondeu nada. Zerei o contexto; manda de novo que eu tento "
+            "do zero.", False)
 
 
 APPS = {
