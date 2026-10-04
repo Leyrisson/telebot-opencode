@@ -398,7 +398,72 @@ APPS = {
     "pastas": ["nautilus"], "spotify": ["spotify"], "discord": ["discord"],
     "telegram": ["telegram-desktop"], "calculadora": ["qalculate"],
     "loja": ["pamacor"], "okular": ["okular"],
+    # qBittorrent: instalado em /usr/bin (pacman 5.2.3) mas faltava aqui. Sem
+    # esta entrada o /abrir caía no `acha_binario`, que acha o binário — mas o
+    # dono não tinha como pedir por nome e o caminho de erro não ajudava.
+    "qbittorrent": ["qbittorrent"], "torrent": ["qbittorrent"],
+    "qbitorrent": ["qbittorrent"], "qbit": ["qbittorrent"],
 }
+
+# Apps que aqui NÃO têm GUI possível, e o certo é abrir a interface web.
+#
+# qBittorrent: o `qbittorrent.service` do sistema roda `qbittorrent-nox
+# --webui-port=8080` (headless). GUI e nox dividem o MESMO lock de instância
+# única, então pedir "abre o qbittorrent" launching `qbittorrent` só acordava o
+# daemon e não abria janela nenhuma — 2026-10-04, foi exatamente o "não abre" do
+# dono. A WebUI é o mesmo cliente e responde em localhost:8080.
+URLS_APP = {
+    "qbittorrent": "http://localhost:8080",
+    "qbit": "http://localhost:8080",
+    "torrent": "http://localhost:8080",
+    "qbitorrent": "http://localhost:8080",
+}
+
+
+def porta_ouvida(host, porta, timeout=2):
+    import socket
+    with socket.socket() as s:
+        s.settimeout(timeout)
+        return s.connect_ex((host, porta)) == 0
+
+
+# Endereço colado sem esquema: "localhost:5000", "127.0.0.1:8080",
+# "exemplo.com/pagina". É o formato que a ajuda do /abrir sugere, então tem que
+# funcionar — e continua sendo http, nunca javascript: ou file:.
+ENDERECO = re.compile(
+    r"^(localhost|127\.0\.0\.1|\[::1\]|[\w-]+(\.[\w-]+)+)(:\d+)?(/\S*)?$", re.I)
+
+
+def _env_gui():
+    """Ambiente com o PATH e as variáveis de sessão do dono.
+
+    O serviço roda sem sessão gráfica; sem DISPLAY/WAYLAND_DISPLAY/DBUS o
+   xdg-open não acha o navegador e o app abre em lugar nenhum.
+    """
+    env = os.environ.copy()
+    env.update({"PATH": PATH, "DISPLAY": env.get("DISPLAY", ":0"),
+                "WAYLAND_DISPLAY": descobre_wayland(),
+                "XDG_RUNTIME_DIR": env.get("XDG_RUNTIME_DIR",
+                                           f"/run/user/{os.getuid()}"),
+                "DBUS_SESSION_BUS_ADDRESS": env.get(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    f"unix:path=/run/user/{os.getuid()}/bus")})
+    return env
+
+
+def _abre_url(url, alvo, nota="Abri"):
+    """Abre uma URL no navegador padrão. Devolve (texto, deu_certo)."""
+    exe = acha_binario("xdg-open")
+    if not exe:
+        return ("❌ Não achei 'xdg-open' no PATH deste serviço.", False)
+    try:
+        subprocess.Popen([exe, url], env=_env_gui(), cwd=str(WORKDIR),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:
+        return (f"❌ Falhou ao abrir '{alvo}': {e}", False)
+    log(f"abriu {url} -> {exe}")
+    return (f"✅ {nota}: *{url}*", True)
 
 
 def abrir_alvo(alvo):
@@ -411,12 +476,21 @@ def abrir_alvo(alvo):
     if not alvo:
         return ("Diga o que abrir: /abrir firefox, /abrir vscode, "
                 "/abrir localhost:5000", False)
+    # App que só existe como interface web (qBittorrent com o daemon nox no ar):
+    # abrir a GUI não adianta, então abre a URL.
+    url_app = URLS_APP.get(alvo.lower())
+    if url_app and porta_ouvida("localhost", 8080):
+        return _abre_url(url_app, alvo,
+                         "Abri a WebUI (o cliente roda como daemon, sem janela)")
+    # Endereço sem esquema: o regex de esquema abaixo exige ":" e não pega.
+    if ENDERECO.match(alvo):
+        return _abre_url("http://" + alvo, alvo)
     # URL (http, https, about:, file:, mailto:) — abre no navegador padrão
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:(//)?\S", alvo):
         if not re.match(r"^(https?|file|mailto):", alvo, re.I):
             return (f"Não abro '{alvo}' por segurança — só http(s), file e mailto.",
                     False)
-        cmd = ["xdg-open", alvo]
+        return _abre_url(alvo, alvo)
     else:
         cmd = APPS.get(alvo.lower())
         if not cmd:
@@ -426,14 +500,7 @@ def abrir_alvo(alvo):
                         f"Apps rápidos: {', '.join(sorted(set(APPS))[:14])}…\n"
                         "Ou mande a frase completa que eu uso o opencode.", False)
             cmd = [alvo]
-    env = os.environ.copy()
-    env.update({"PATH": PATH, "DISPLAY": env.get("DISPLAY", ":0"),
-                "WAYLAND_DISPLAY": descobre_wayland(),
-                "XDG_RUNTIME_DIR": env.get("XDG_RUNTIME_DIR",
-                                           f"/run/user/{os.getuid()}"),
-                "DBUS_SESSION_BUS_ADDRESS": env.get(
-                    "DBUS_SESSION_BUS_ADDRESS",
-                    f"unix:path=/run/user/{os.getuid()}/bus")})
+    env = _env_gui()
     exe = cmd[0] if Path(cmd[0]).is_absolute() else acha_binario(cmd[0])
     if not exe:
         return (f"❌ Não achei '{cmd[0]}' no PATH deste serviço.", False)

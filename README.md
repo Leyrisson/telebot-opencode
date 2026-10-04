@@ -53,7 +53,23 @@ repetindo o erro a cada mensagem.
 
 Apps que o `/abrir` reconhece: firefox, chrome/chromium, vscode, terminal
 (alacritty/kitty/ghostty), arquivos, spotify, discord, telegram, calculadora,
-loja, okular.
+loja, okular, qbittorrent.
+
+Também aceita endereço: `/abrir localhost:8080`, `/abrir exemplo.com/pagina`.
+Sem esquema vira `http://` automaticamente; `javascript:` e `file:` ficam
+bloqueados (só `http`, `https`, `file` e `mailto` passam).
+
+### qBittorrent: WebUI em vez de janela
+
+Se o qBittorrent roda como daemon (`qbittorrent-nox`, comum em instalação que
+sobe no boot), **`/abrir qbittorrent` não abre janela — e não deve**. GUI e
+`qbittorrent-nox` dividem o mesmo lock de instância única, então pedir o GUI
+apenas acorda o daemon e nada aparece na tela.
+
+Nesses casos o `/abrir` detecta a porta 8080 respondendo e abre a **WebUI**
+(`http://localhost:8080`), que é o mesmo cliente. Se o daemon não estiver no
+ar, cai no caminho normal e tenta o GUI. Vale para os apelidos `qbit`,
+`torrent` e `qbitorrent`.
 
 ## Instalação
 
