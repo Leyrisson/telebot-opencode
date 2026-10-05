@@ -113,6 +113,13 @@ CARENCIA = 25                      # silêncio depois do último evento = travou
 MAX_ENVIO = 3800                   # Telegram corta em 4096; fica folga p/ moldura
 POLL = 30                          # segundos de long-poll
 
+# --- Candidaturas: responder as perguntas das vagas travadas ---------------
+# Onde mora o projeto de candidaturas. Por env var para o repositório publico
+# não carregar o caminho do dono; o padrão é relativo ao HOME do usuario
+CAND = Path(os.environ.get(
+    "VAGAS_DIR", Path.home() / "n8n-docker/workflows/host/candidatura"))
+SESSAO_VAGA = STATE / "vaga-sessao.json"
+
 # Só este chat conversa com o bot. Trava de segurança: mesmo com o token
 # vazado, ninguem mais consegue mandar comando no seu PC.
 # Vem do credenciais.env (TELEGRAM_CHAT_ID) — nunca versionado.
@@ -177,7 +184,11 @@ def api(env, metodo, payload=None, params=None, timeout=70):
 
 
 def manda(chat, texto, botao=None):
-    """Envia mensagem. Texto longo e cortado em pedaços que caibam no limite."""
+    """Envia mensagem. Texto longo e cortado em pedaços que caibam no limite.
+
+    `botao` = [[("texto", callback_data)], ...] monta teclado inline. Só vai no
+    primeiro pedaço: botao no meio de um texto cortado é confuso, e Telegram
+    ignora teclado quando a mensagem é enviada por partes."""
     texto = str(texto or "").strip() or "(vazio)"
     linhas, atual, tamanho = [], [], 0
     for ln in texto.splitlines() or [""]:
@@ -190,10 +201,18 @@ def manda(chat, texto, botao=None):
     if atual:
         linhas.append("\n".join(atual))
     api_env = load_env()
+    teclado = None
+    if botao:
+        teclado = {"inline_keyboard": [
+            [{"text": t, "callback_data": d} for t, d in linha]
+            for linha in botao]}
     for i, parte in enumerate(linhas, 1):
         cab = f"[{i}/{len(linhas)}]\n" if len(linhas) > 1 else ""
-        api(api_env, "sendMessage", {
-            "chat_id": chat, "text": cab + parte, "disable_web_page_preview": True})
+        corpo = {"chat_id": chat, "text": cab + parte,
+                 "disable_web_page_preview": True}
+        if i == 1 and teclado:
+            corpo["reply_markup"] = json.dumps(teclado, ensure_ascii=False)
+        api(api_env, "sendMessage", corpo)
         time.sleep(0.4)
 
 
@@ -530,6 +549,257 @@ def diagnostico():
     return "\n".join(linhas)
 
 
+def le_sessoes():
+    try:
+        d = json.loads(SESSAO_VAGA.read_text(encoding="utf-8"))
+        return d if isinstance(d, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def guarda_sessoes(sessoes):
+    tmp = SESSAO_VAGA.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sessoes, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    tmp.replace(SESSAO_VAGA)
+
+
+def vaga_do_message_id(mid):
+    """Qual vaga o dono respondeu, a partir do message_id da mensagem.
+
+    É o `mandar-telegram.py` que grava esse mapa quando avisa as vagas. Sem ele
+    o bot teria que adivinhar a vaga, ou obrigar o dono a digitar o id."""
+    if not mid or not (CAND / "telegram-vagas.json").exists():
+        return None
+    try:
+        d = json.loads((CAND / "telegram-vagas.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return (d.get("mensagens") or {}).get(str(mid))
+
+
+def dados_da_vaga(url):
+    """Título e perguntas da vaga, lidos do jsonl da coleta (fonte da verdade)."""
+    arq = CAND / "resultado-vagas.jsonl"
+    titulo, perguntas = url, []
+    if not arq.exists():
+        return titulo, perguntas
+    for l in arq.read_text(encoding="utf-8").splitlines():
+        if not l.strip():
+            continue
+        try:
+            v = json.loads(l)
+        except ValueError:
+            continue
+        if (v.get("url") or "").split("?")[0] == url:
+            t = (v.get("titulo") or "").replace("Vaga de Emprego de ", "")
+            return t.strip()[:64], [q.strip() for q in (v.get("perguntas") or [])
+                                    if q.strip()]
+    return titulo, perguntas
+
+
+def sessao_ativa():
+    for s in le_sessoes():
+        if s.get("i", 0) < len(s.get("perguntas") or []):
+            return s
+    return None
+
+
+def pede_resposta(s, chat):
+    """Manda a próxima pergunta e avisa quantas faltam."""
+    p = s["perguntas"][s.get("i", 0)]
+    falta = len(s["perguntas"]) - s.get("i", 0)
+    manda(chat, f"*{s.get('titulo', 'Vaga')}*\n"
+                f" Pergunta {s.get('i', 0) + 1} de {len(s['perguntas'])}"
+                f" (faltam {falta}):\n\n{p}\n\n"
+                "_Responde aqui. Se quiser pular, escreve `pula`_",
+            botao=[[("❌ cancelar", f"desc:{s['id']}")]])
+
+
+def _classifica_respostas(s, dry_run):
+    """Chama o gravar-respostas.py uma vez por pergunta.
+
+    `dry_run=True` só classifica e relata, sem gravar: é o que monta a prévia do
+    resumo, para o dono ver o que vai ser aprendido ANTES de apertar Enviar."""
+    registro = CAND / "gravar-respostas.py"
+    if not registro.exists():
+        return []
+    linhas = []
+    for p, r in zip(s.get("perguntas") or [], s.get("respostas") or []):
+        if not (r or "").strip():
+            continue
+        cmd = [sys.executable, str(registro), "--url", s["url"],
+               "--pergunta", p, "--resposta", r]
+        if dry_run:
+            cmd.append("--dry-run")
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            linhas.append(json.loads(out.stdout or "{}"))
+        except (ValueError, subprocess.SubprocessError) as e:
+            linhas.append({"ok": False, "pergunta": p, "erro": str(e)})
+    return linhas
+
+
+def previa_aprendizado(s):
+    """O que das respostas vai virar regra permanente. Não grava nada."""
+    return _classifica_respostas(s, True)
+
+
+def grava_respostas_da_sessao(s):
+    """Grava as respostas e promove ao perfil.json o que for reaproveitável.
+
+    Escolha do dono (04/10): reaproveitar o objetivo, guardar o resto na vaga.
+    Sem `--so-nesta-vaga`, a promoção acontece — mas só entra pergunta fechada
+    com resposta curta; salário, disponibilidade, texto longo, anexo e resposta
+    aberta ficam presos naquela vaga, porque "aceitei R$ 2.400 na empresa A" não
+    pode virar regra que faz o bot aceitar qualquer salário depois.
+
+    O que foi promovido e o que ficou só na vaga foi mostrado no resumo, antes
+    deste botão. Errou? `/descartar` e responde de novo."""
+    return _classifica_respostas(s, False)
+
+
+def envia_vaga(s, chat):
+    """Enfileira a vaga e espera o sidecar aplicar de verdade.
+
+    NÃO usa POST /vaga: esse endpoint só LÊ a página (devolve title/url/texto/
+    links) e devolve a candidatura para `pronta_para_candidatar`. Quem aplica é
+    o watcher, lendo `fila-vagas.jsonl`. Chamar /vaga aqui daria "funcionou" sem
+    ter candidatado nada.
+
+    Devolve o dicionário do resultado, ou {"erro": ...}."""
+    fila = CAND / "fila-vagas.jsonl"
+    resultado = CAND / "resultado-vagas.jsonl"
+    # messageId sintético: a chave de dedupe é messageId|url, e as linhas
+    # enfileiradas à mão já usam esse padrão (ver _chave no sidecar).
+    msgid = f"telegram-{s['id']}"
+    chave = f"{msgid}|{s['url']}"
+
+    antes = _tamanho(resultado)
+    item = {"url": s["url"], "messageId": msgid, "origem": "telegram",
+            "subject": s.get("titulo", "")[:120], "snippet": "",
+            "idVaga": None, "analise": {}}
+    try:
+        with fila.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    except OSError as e:
+        return {"erro": f"nao consegui enfileirar: {e}"}
+    log(f"vaga enfileirada: {chave}")
+
+    # O watcher roda a cada WATCH_SEG (5s) e pode segurar o perfil do browser,
+    # então a espera é generosa. Quem responde é o fim do arquivo de resultado.
+    limite = time.time() + 420
+    while time.time() < limite:
+        time.sleep(6)
+        achado = _resultado_chave(resultado, chave, antes)
+        if achado is not None:
+            return achado
+    return {"erro": "enfileirei, mas o sidecar nao/devolveu resultado em 7 min"}
+
+
+def _tamanho(arq):
+    try:
+        return arq.stat().st_size
+    except OSError:
+        return 0
+
+
+def _resultado_chave(arq, chave, desde):
+    """Procura a linha do resultado com esta chave, considering só o que foi
+    escrito DEPOIS do enfileiramento — senão uma linha antiga de uma
+    tentativa anterior seria lida como se fosse a de agora."""
+    try:
+        with arq.open("r", encoding="utf-8") as f:
+            f.seek(desde)
+            for l in f:
+                if not l.strip():
+                    continue
+                try:
+                    d = json.loads(l)
+                except ValueError:
+                    continue
+                if d.get("chave") == chave:
+                    return d
+    except OSError:
+        return None
+    return None
+
+
+def trata_vaga_confirmada(idx, chat, api_env):
+    sessoes = le_sessoes()
+    if not (0 <= idx < len(sessoes)):
+        api(api_env, "answerCallbackQuery",
+            {"callback_query_id": "?", "text": "Sessao velha."})
+        return
+    s = sessoes[idx]
+    registros = [r for r in grava_respostas_da_sessao(s) if r.get("ok")]
+    if not registros:
+        manda(chat, "⚠️ Não consegui registrar suas respostas, então **não "
+                    "candidatarei** — seria enviar em branco. Tenta de novo.")
+        log_erro(f"vaga confirmada sem registro nenhum: {s['url']}")
+        return
+    promovidos = [r for r in registros if r.get("promovido_ao_perfil")]
+    aviso = ("\n\n📚 Vou reaproveitar daqui pra frente: "
+             + "; ".join(f"*{r['pergunta']}* → {r['resposta']}"
+                         for r in promovidos)
+             if promovidos else "")
+    manda(chat, "📨 Registrei suas respostas e chamei o navegador.\n"
+                f"Vaga: *{s.get('titulo', '')}*\n"
+                "Se a tela aparecer no PC, é o portal pedindo o login "
+                "ou revisando o resultado. Te aviso aqui." + aviso)
+    res = envia_vaga(s, chat)
+    etapa = res.get("etapa")
+    if res.get("erro"):
+        manda(chat, f"⚠️ O sidecar nao respondeu: {str(res['erro'])[:200]}")
+    elif etapa in (None, "candidatado", "ja_candidatado"):
+        manda(chat, f"✅ Candidatura registrada ({etapa or 'ok'}).")
+    else:
+        manda(chat, f"ℹ️ A vaga parou em *{etapa}*"
+                    + (f": {', '.join(res.get('perguntas') or [])[:300]}"
+                       if res.get("perguntas") else "")
+                    + "\nSe eu nao souber responder, te aviso aqui.")
+    sessoes.pop(idx)
+    guarda_sessoes(sessoes)
+    log(f"vaga confirmada: {s['url']} -> {etapa}"
+        + (f" | promoteu {len(promovidos)}" if promovidos else ""))
+
+
+def trata_callback(cb, api_env):
+    """Clique nos botões de confirmação das vagas."""
+    cid = cb.get("id", "")
+    dado = (cb.get("data") or "").strip()
+    chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+    acao, _, alvo = dado.partition(":")
+
+    if acao == "desc":
+        sessoes = [s for s in le_sessoes() if s.get("id") != alvo]
+        guarda_sessoes(sessoes)
+        api(api_env, "answerCallbackQuery",
+            {"callback_query_id": cid, "text": "Descartado. Nada foi enviado."})
+        manda(chat, "🗑️ Descartado. A vaga continua parada esperando você, "
+                    "e nenhuma candidatura saiu.")
+        log(f"vaga descartada: {alvo}")
+        return
+
+    if acao == "ok":
+        sessoes = le_sessoes()
+        idx = next((i for i, s in enumerate(sessoes)
+                    if s.get("id") == alvo), None)
+        if idx is None:
+            api(api_env, "answerCallbackQuery",
+                {"callback_query_id": cid, "text": "Sessao velha."})
+            manda(chat, "⚠️ Essa sessão de vaga não existe mais. Responda a "
+                        "mensagem da vaga de novo.")
+            return
+        api(api_env, "answerCallbackQuery",
+            {"callback_query_id": cid, "text": "Registrando e abrindo..."})
+        manda(chat, "⏳ Registrando as respostas e abrindo o navegador…")
+        trata_vaga_confirmada(idx, chat, api_env)
+        return
+
+    api(api_env, "answerCallbackQuery", {"callback_query_id": cid})
+
+
 def trata(mensagem):
     """Roda uma tarefa e responde no Telegram + no PC."""
     texto = (mensagem.get("text") or "").strip()
@@ -538,6 +808,87 @@ def trata(mensagem):
     if not texto or chat != CHAT_ID:
         return
     log(f"msg de {nome}: {texto[:200]}")
+
+    # Resposta de pergunta de vaga: o dono respondeu a mensagem que o
+    # mandar-telegram.py mandou. Tem precedência sobre tudo, senão "sim, 3 anos"
+    # cairia no opencode como se fosse tarefa de programação.
+    resp = mensagem.get("reply_to_message") or {}
+    url = vaga_do_message_id(resp.get("message_id"))
+    if url:
+        sessoes = le_sessoes()
+        s = next((x for x in sessoes if x["url"] == url
+                  and x.get("i", 0) < len(x.get("perguntas") or [])), None)
+        if s is None:
+            titulo, perguntas = dados_da_vaga(url)
+            if not perguntas:
+                manda(chat, "Não achei as perguntas dessa vaga no registro. "
+                            "Rode o `mandar-telegram.py` de novo para ele "
+                            "recoletar.")
+                return
+            # id único: time.time() sozinho repetia dentro do mesmo segundo e
+            # dois botões de confirmação diferentes acabavam com o mesmo
+            # callback_data — clicar num confirmava a outra vaga.
+            s = {"id": str(time.time_ns()), "url": url, "titulo": titulo,
+                 "perguntas": perguntas, "respostas": ["" for _ in perguntas],
+                 "i": 0}
+            sessoes.append(s)
+            guarda_sessoes(sessoes)
+            log(f"sessao de vaga aberta: {url} ({len(perguntas)} perguntas)")
+            # A mensagem que abriu a sessão é só o gatilho ("isso", "essa"),
+            # NÃO é resposta. Sem este return ela entrava como resposta da
+            # primeira pergunta e a revisão saía com o texto errado.
+            pede_resposta(s, chat)
+            return
+        if next((x for x in sessoes if x["url"] == url), None):
+            manda(chat, f"A vaga *{s.get('titulo', '')}* já tem todas as "
+                        "respostas. Use os botões da revisão, ou "
+                        "`/vagas cancelar` para começar de novo.")
+            return
+
+    s = sessao_ativa()
+    if s and not texto.startswith("/"):
+        if texto.lower().strip() in ("pula", "skip", "depois"):
+            s["i"] = s.get("i", 0) + 1
+        else:
+            s["respostas"][s.get("i", 0)] = texto.strip()[:1500]
+            s["i"] = s.get("i", 0) + 1
+        sessoes = le_sessoes()
+        for x in sessoes:
+            if x.get("id") == s.get("id"):
+                x.update(s)
+                break
+        guarda_sessoes(sessoes)
+
+        if s["i"] < len(s["perguntas"]):
+            pede_resposta(s, chat)
+            return
+        # acabou: mostra tudo antes de mandar, porque texto digitado no celular
+        # vai direto pro recrutador com o nome do dono.
+        linhas = [f"*Revise antes de enviar*\n{s.get('titulo', '')}\n"]
+        for p, r in zip(s["perguntas"], s["respostas"]):
+            linhas.append(f"\n*{p}*\n{r or '(pulada)'}")
+        # Previa do aprendizado: o dono escolheu reaproveitar o objetivo, entao
+        # precisa ver QUAIS respostas viram regra permanente antes de confirmar.
+        #.Errou? Descartar e responder de novo.
+        prev = [l for l in previa_aprendizado(s) if l.get("ok")]
+        aprende = [l for l in prev if l.get("reutilizavel")]
+        so_vaga = [l for l in prev if not l.get("reutilizavel")]
+        if aprende:
+            linhas.append("\n*Vou guardar e reaproveitar daqui pra frente:*")
+            linhas += [f"\n• *{l['pergunta']}*\n{l['resposta']}"
+                       + (f"  _(perfil já tem regra)_" if "ja existia" in
+                          (l.get("motivo") or "") else "")
+                       for l in aprende]
+        if so_vaga:
+            linhas.append("\n*Ficam só nesta vaga:*")
+            linhas += [f"\n• *{l['pergunta']}*\n{l['resposta']}  "
+                       f"({l.get('motivo', '')})" for l in so_vaga]
+        linhas.append("\n\nVou registrar as respostas e abrir a candidatura. "
+                      "O que está acima é o que vai sair com o seu nome.")
+        manda(chat, "\n".join(linhas),
+              botao=[[("📨 Enviar candidatura", f"ok:{s['id']}"),
+                      ("❌ Descartar", f"desc:{s['id']}")]])
+        return
 
     partes = texto.split(maxsplit=1)
     cmd = partes[0].lower().lstrip("/")
@@ -572,6 +923,24 @@ def trata(mensagem):
     if cmd == "novo":
         guarda_sessao("")
         manda(chat, "Contexto zerado. Próxima mensagem começa do zero.")
+        return
+    if cmd == "vagas" and resto.strip() in ("cancelar", "cancel", "zerar"):
+        guarda_sessoes([])
+        manda(chat, "Sessões de vaga zeradas.")
+        return
+    if cmd == "vagas":
+        sessoes = le_sessoes()
+        if not sessoes:
+            manda(chat, "Nenhuma vaga em espera de resposta.")
+            return
+        linhas = ["*Vagas esperando resposta:*"]
+        for s in sessoes:
+            falta = len(s["perguntas"]) - s.get("i", 0)
+            linhas.append(f"• {s.get('titulo', '')} — "
+                          f"{falta} de {len(s['perguntas'])}")
+        linhas.append("\nResponda a mensagem da vaga, ou `/vagas cancelar` "
+                      "para zerar.")
+        manda(chat, "\n".join(linhas))
         return
 
     avisa_pc("opencode", f"{nome}: {texto[:80]}")
@@ -633,7 +1002,11 @@ def main():
             try:
                 r = api(env, "getUpdates",
                         params={"timeout": POLL, "offset": offset,
-                                "allowed_updates": '["message"]'})
+                                # callback_query é o clique nos botões de
+                                # confirmação; sem ele no allowed_updates o
+                                # Telegram nem entrega o clique.
+                                "allowed_updates":
+                                    '["message","callback_query"]'})
             finally:
                 _lock.release()
         if not r or not r.get("ok"):
@@ -642,6 +1015,20 @@ def main():
         for upd in r.get("result", []):
             offset = upd["update_id"] + 1
             guarda_offset(offset)
+
+            cb = upd.get("callback_query")
+            if cb:
+                if str(cb.get("message", {}).get("chat", {}).get("id", "")
+                       ) != CHAT_ID:
+                    continue
+                try:
+                    trata_callback(cb, env)
+                except Exception as e:
+                    log_erro(f"ERRO no botao: {e}")
+                    manda(CHAT_ID, f"⚠️ Deu erro no botão: {e}")
+                time.sleep(0.5)
+                continue
+
             msg = upd.get("message") or {}
             # só o SEU chat dispara tarefa; o resto é ignorado em silêncio
             if str(msg.get("chat", {}).get("id", "")) != CHAT_ID:

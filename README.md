@@ -48,6 +48,9 @@ repetindo o erro a cada mensagem.
 | `/abrir firefox` | abre o app na hora, **sem passar pelo opencode** (instantâneo e à prova de sessão morta) |
 | `/teste` | diagnóstico: token, chat, binário do opencode, display, sessão |
 | `/status` | o que está sendo executado agora |
+| `/vagas` | lista as vagas travadas esperando resposta e pergunta no chat, uma por vez |
+| `/pular` | pula a pergunta atual e mostra a próxima |
+| `/descartar` | joga fora a sessão de respostas e começa de novo |
 | `/novo` | zera a memória, começa do zero |
 | `/start`, `/ajuda`, `/help` | menu com exemplos |
 
@@ -183,3 +186,31 @@ espera a rede resolver antes de começar a fazer poll.
 - Python 3 (só stdlib: `urllib`, `json`, `subprocess`, `shutil`) — sem pip install
 - [opencode](https://opencode.ai) instalado
 - Linux com systemd (unidade de usuário) e Wayland ou X11
+## Vagas: responder o questionário pelo chat
+
+Vaga com formulário travava e a única forma de responder era abrir o browser.
+Agora dá para responder do próprio Telegram, e **nada é candidato sem o seu
+botão**:
+
+```
+vaga: Analista de TI
+
+1/3  Aceita o salário de R$ 2.400,00? *
+    (responda, ou /pular)
+```
+
+No fim aparece o resumo com **Enviar** e **Descartar**. O botão **Enviar**
+grava a resposta (o que for objetivo e genérico vai para o `perfil.json` e
+reaproveita nas próximas vagas) e só então enfileira a candidatura.
+
+Duas armadilhas que já custaram uma candidatura errada:
+
+- **`POST /vaga` não candidata.** Esse endpoint só lê a página e devolve texto
+  e links. Quem preenche e envia é o watcher do sidecar, lendo o
+  `fila-vagas.jsonl`. Chamar o endpoint errado dá "enviei" sem ter feito nada.
+- **Uma mensagem por vaga.** A Catho escreve `*` nos campos obrigatórios e,
+  se as perguntas viajarem num texto só, os `*` se casam entre perguntas
+  diferentes e o formulário recebe lixo.
+
+O caminho do projeto de vagas vem de `VAGAS_DIR`, com padrão relativo ao
+`HOME` — o repositório não carrega o caminho de ninguém.
